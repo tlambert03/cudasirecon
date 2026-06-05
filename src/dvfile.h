@@ -1,12 +1,14 @@
 #ifndef DVFILE_H
 #define DVFILE_H
 
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 // Data Types
 #define IW_AS_IS -1
@@ -114,6 +116,10 @@ class DVFile {
   bool _big_endian;
   IW_MRC_Header hdr;
   bool closed = true;
+  // IVE "ConversionFlag": when true (the default), integer pixel types are
+  // converted to/from float on read/write (the caller works in float).  Toggled
+  // per stream by IMAlCon.
+  bool _convert = true;
 
   // Private default constructor
   DVFile() = default;
@@ -142,6 +148,13 @@ class DVFile {
     // Read header
     _file->seekg(0);
     _file->read(reinterpret_cast<char*>(&hdr), sizeof(IW_MRC_Header));
+    // Position the read/write pointer at the first pixel section, i.e. just past
+    // the extended header (inbsym bytes).  Sequential reads (bare IMRdSec, used to
+    // load OTF and PSF files) rely on the stream starting at the data; IVE leaves
+    // the file positioned there after IMOpen/IMRdHdr.  Without this, files that
+    // carry an extended header (real .otf/.dv from the microscope) are read
+    // starting inside the extended header -> garbage/zeros.
+    _seekToData();
     closed = false;
   }
 
@@ -219,11 +232,31 @@ class DVFile {
     _file->seekp(offset);
   }
 
+  void setConvert(bool convert) { _convert = convert; }
+
   void readSec(void* array) {
     if (closed) {
       throw std::runtime_error("Cannot read from closed file. Please reopen with .open()");
     }
-    _file->read(reinterpret_cast<char*>(array), _sectionSize());
+    if (!_convert || hdr.mode == IW_FLOAT || hdr.mode == IW_COMPLEX) {
+      // already the working type (or conversion disabled): read raw bytes
+      _file->read(reinterpret_cast<char*>(array), _sectionSize());
+      return;
+    }
+    // integer storage with ConversionFlag on: read native type, convert to float
+    size_t npix = static_cast<size_t>(hdr.ny) * hdr.nx;
+    float* out = reinterpret_cast<float*>(array);
+    switch (hdr.mode) {
+      case IW_BYTE:          _readAs<uint8_t>(out, npix); break;
+      case IW_SHORT:         _readAs<int16_t>(out, npix); break;
+      case IW_EMTOM:         _readAs<int16_t>(out, npix); break;
+      case IW_USHORT:        _readAs<uint16_t>(out, npix); break;
+      case IW_LONG:          _readAs<int32_t>(out, npix); break;
+      case IW_COMPLEX_SHORT: _readAs<int16_t>(out, 2 * npix); break;
+      default:
+        throw std::runtime_error("Unsupported pixel mode for conversion: " +
+                                 std::to_string(hdr.mode));
+    }
   }
 
   void readSec(void* array, int t, int w, int z) {
@@ -236,7 +269,24 @@ class DVFile {
     if (closed) {
       throw std::runtime_error("Cannot write to closed file. Please reopen with .open()");
     }
-    _file->write(reinterpret_cast<const char*>(array), _sectionSize());
+    if (!_convert || hdr.mode == IW_FLOAT || hdr.mode == IW_COMPLEX) {
+      _file->write(reinterpret_cast<const char*>(array), _sectionSize());
+      return;
+    }
+    // float working data with ConversionFlag on: convert to the stored int type
+    size_t npix = static_cast<size_t>(hdr.ny) * hdr.nx;
+    const float* in = reinterpret_cast<const float*>(array);
+    switch (hdr.mode) {
+      case IW_BYTE:          _writeAs<uint8_t>(in, npix); break;
+      case IW_SHORT:         _writeAs<int16_t>(in, npix); break;
+      case IW_EMTOM:         _writeAs<int16_t>(in, npix); break;
+      case IW_USHORT:        _writeAs<uint16_t>(in, npix); break;
+      case IW_LONG:          _writeAs<int32_t>(in, npix); break;
+      case IW_COMPLEX_SHORT: _writeAs<int16_t>(in, 2 * npix); break;
+      default:
+        throw std::runtime_error("Unsupported pixel mode for conversion: " +
+                                 std::to_string(hdr.mode));
+    }
   }
 
   size_t getPixelSize() { return pixelTypeSizes.at(hdr.mode); }
@@ -247,6 +297,9 @@ class DVFile {
       if (!_file->is_open()) {
         throw std::runtime_error("Failed to open file");
       }
+      // Reopened at offset 0; reposition at the first data section so sequential
+      // (bare) reads/writes start at the pixel data, not the header.
+      _seekToData();
       closed = false;
     }
   }
@@ -271,13 +324,44 @@ class DVFile {
     _file->seekp(0);
     _file->write(reinterpret_cast<const char*>(&header), sizeof(IW_MRC_Header));
     hdr = header;
+    // Position writes at the first data section (past any extended header) so
+    // subsequent sequential IMWrSec calls land on the pixel data.
+    _seekToData();
   }
 
   bool isClosed() const { return closed; }
 
  private:
+  // Byte offset of the first pixel section: main header + extended header.
+  std::streamoff _dataOffset() const {
+    return static_cast<std::streamoff>(sizeof(IW_MRC_Header)) +
+           (hdr.inbsym > 0 ? hdr.inbsym : 0);
+  }
+
+  // Position both get/put pointers at the first pixel section (past the ext hdr).
+  void _seekToData() {
+    _file->seekg(_dataOffset());
+    _file->seekp(_dataOffset());
+  }
+
   // Return the size of a frame/section in bytes
   size_t _sectionSize() { return hdr.ny * hdr.nx * getPixelSize(); }
+
+  // Read `n` elements of stored type T and convert to float into `out`.
+  template <typename T>
+  void _readAs(float* out, size_t n) {
+    std::vector<T> tmp(n);
+    _file->read(reinterpret_cast<char*>(tmp.data()), n * sizeof(T));
+    for (size_t i = 0; i < n; ++i) out[i] = static_cast<float>(tmp[i]);
+  }
+
+  // Convert `n` floats in `in` to stored type T and write them.
+  template <typename T>
+  void _writeAs(const float* in, size_t n) {
+    std::vector<T> tmp(n);
+    for (size_t i = 0; i < n; ++i) tmp[i] = static_cast<T>(in[i]);
+    _file->write(reinterpret_cast<const char*>(tmp.data()), n * sizeof(T));
+  }
 
   void _validateZWT(int z, int w, int t) {
     if (t >= hdr.num_times) {
@@ -375,23 +459,16 @@ inline void IMRdHdr(int istream, int ixyz[3], int mxyz[3], int* imode, float* mi
 /**
  * @brief Set the image conversion mode during read/write operations from image storage.
  *
- * By default in IVE, images that are read from image storage are converted to
- * 4-byte floating-point data. Similarly, when images are written to image
- * storage they are converted to the data type indicated by the image data type
- * associated with the corresponding stream (see IMAlMode). The default in IVE
- * is ConversionFlag=TRUE.
- * We, however, don't ever convert the data type of the image data. So for now,
- * this is a no-op.
+ * By default in IVE, images read from storage are converted to 4-byte float, and
+ * images written are converted to the stream's stored data type. The default is
+ * ConversionFlag=TRUE.  We honor that: with the flag on, integer pixel types are
+ * converted to/from float on read/write; with it off, raw bytes are used.
  *
  * @param istream The input stream to be used for the operation.
- * @param flag The flag indicating the type of operation to be performed.
+ * @param flag Nonzero => ConversionFlag ON (convert); zero => raw I/O.
  */
 inline void IMAlCon(int istream, int flag) {
-  // if flag is 1, warn:
-  if (flag == 1) {
-    std::cerr << "Warning: IMAlCon is not implemented. ConversionFlag=TRUE is not supported."
-              << std::endl;
-  }
+  getDVFile(istream).setConvert(flag != 0);
 }
 
 /**
