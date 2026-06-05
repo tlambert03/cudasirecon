@@ -1099,7 +1099,13 @@ void outputdata(int ostream_no, IW_MRC_HEADER *header,  std::vector<std::complex
   header->zlen = 0;
   header->amin = 0;
   header->amax = 1;
-  
+  // The OTF is written with no extended header; the input PSF's extended-header
+  // fields would otherwise be carried over and make readers seek past phantom
+  // per-section metadata that was never written.
+  header->inbsym = 0;
+  header->nint = 0;
+  header->nreal = 0;
+
   IMPutHdr(ostream_no, header);
   for (int i=0; i<norders; i++)
     if (i==0)

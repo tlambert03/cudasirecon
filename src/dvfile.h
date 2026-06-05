@@ -1,7 +1,9 @@
 #ifndef DVFILE_H
 #define DVFILE_H
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -141,6 +143,11 @@ class DVFile {
       _big_endian = false;
     } else if (dvid[0] == (char)0xC0 && dvid[1] == (char)0xA0) {
       _big_endian = true;
+      // This reader does not byte-swap; a big-endian file would be silently
+      // mis-read (header fields and pixels).  All modern DeltaVision data is
+      // little-endian, so reject big-endian explicitly rather than corrupt it.
+      throw std::runtime_error(
+          path + " is big-endian, which this reader does not support.");
     } else {
       throw std::runtime_error(path + " is not a recognized DV file.");
     }
@@ -233,6 +240,30 @@ class DVFile {
   }
 
   void setConvert(bool convert) { _convert = convert; }
+
+  // Read the per-section extended-header values for section (z,w,t).  The DV
+  // extended header stores, for each section in ZWT order, `nint` int32 values
+  // followed by `nreal` float32 values (the standard DV float fields are
+  // photosensor, timestamp, stageX/Y/Z, min/max/mean, expTime, ...).  `ival` and
+  // `rval` must have room for `nint` ints and `nreal` floats respectively.  The
+  // current get-pointer is preserved so this can be called between sequential
+  // section reads.
+  void readExtHdrZWT(int z, int w, int t, int* ival, float* rval) {
+    int ni = hdr.nint, nr = hdr.nreal;
+    if (hdr.inbsym <= 0 || (ni <= 0 && nr <= 0)) return;  // no extended header
+    int is = sectionOffset(z, w, t);
+    std::streamoff rec = static_cast<std::streamoff>(ni + nr) * 4;
+    if ((static_cast<std::streamoff>(is) + 1) * rec > hdr.inbsym) return;  // out of range
+    std::streamoff off = static_cast<std::streamoff>(sizeof(IW_MRC_Header)) +
+                         static_cast<std::streamoff>(is) * rec;
+    _file->clear();  // sequential reads may have left eofbit set
+    std::streampos saved = _file->tellg();
+    _file->seekg(off);
+    if (ni > 0) _file->read(reinterpret_cast<char*>(ival), ni * 4);
+    if (nr > 0) _file->read(reinterpret_cast<char*>(rval), nr * 4);
+    _file->clear();
+    if (saved >= 0) _file->seekg(saved);
+  }
 
   void readSec(void* array) {
     if (closed) {
@@ -355,11 +386,13 @@ class DVFile {
     for (size_t i = 0; i < n; ++i) out[i] = static_cast<float>(tmp[i]);
   }
 
-  // Convert `n` floats in `in` to stored type T and write them.
+  // Convert `n` floats in `in` to stored type T and write them.  Integer targets
+  // are rounded to nearest (matching IVE), not truncated toward zero.
   template <typename T>
   void _writeAs(const float* in, size_t n) {
     std::vector<T> tmp(n);
-    for (size_t i = 0; i < n; ++i) tmp[i] = static_cast<T>(in[i]);
+    for (size_t i = 0; i < n; ++i)
+      tmp[i] = static_cast<T>(std::lround(in[i]));
     _file->write(reinterpret_cast<const char*>(tmp.data()), n * sizeof(T));
   }
 
@@ -480,7 +513,16 @@ inline void IMAlCon(int istream, int flag) {
  * @param num_titles The number of titles to be changed.
  */
 inline void IMAlLab(int istream, const char* labels, int nl) {
-  std::cerr << "Warning: IMAlLab is not implemented." << std::endl;
+  // The DV header holds up to 10 title records of 80 chars each (label[800]).
+  // `labels` is nl contiguous 80-char records.
+  DVFile& dvfile = getDVFile(istream);
+  IW_MRC_HEADER header = dvfile.getHeader();
+  if (nl < 0) nl = 0;
+  if (nl > 10) nl = 10;
+  std::memset(header.label, ' ', sizeof(header.label));
+  if (nl > 0) std::memcpy(header.label, labels, static_cast<size_t>(nl) * 80);
+  header.nlab = nl;
+  dvfile.putHeader(header);
 }
 
 /**
@@ -591,16 +633,20 @@ inline void IMWrHdr(int istream, const char title[80], int ntflag, float dmin, f
   header.amin = dmin;
   header.amax = dmax;
   header.amean = dmean;
+  int nlab = header.nlab;
+  if (nlab < 0) nlab = 0;
+  if (nlab > 10) nlab = 10;
   if (ntflag == 0) {
-    // use Title as the only title
-    strncpy(header.label, title, 80);
+    // use `title` as the only title (one 80-char record)
+    std::memset(header.label, ' ', sizeof(header.label));
+    std::memcpy(header.label, title, 80);
+    header.nlab = 1;
   } else if (ntflag == 1) {
-    // FIXME  this is wrong.
-    // Append title to the end of the list
-    std::string new_title = title;
-    new_title += " ";
-    new_title += header.label;
-    strncpy(header.label, new_title.c_str(), 80);
+    // append `title` as a new 80-char record, if there is room (max 10)
+    if (nlab < 10) {
+      std::memcpy(header.label + static_cast<size_t>(nlab) * 80, title, 80);
+      header.nlab = nlab + 1;
+    }
   } else {
     throw std::runtime_error("Invalid ntflag: " + std::to_string(ntflag));
   }
@@ -618,7 +664,10 @@ inline void IMWrHdr(int istream, const char title[80], int ntflag, float dmin, f
  *
  */
 inline void IMRtExHdrZWT(int istream, int iz, int iw, int it, int ival[], float rval[]) {
-  std::cerr << "Warning: IMRtExHdrZWT is not implemented." << std::endl;
+  // `ival`/`rval` must hold at least nint ints and nreal floats (the per-section
+  // extended-header sizes from the file header); the caller is responsible for
+  // sizing them accordingly.
+  getDVFile(istream).readExtHdrZWT(iz, iw, it, ival, rval);
 }
 
 #endif  // DVFILE_H

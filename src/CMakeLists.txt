@@ -76,3 +76,9 @@ message(STATUS "CUDA_NVCC_FLAGS: " ${CUDA_NVCC_FLAGS})
 add_subdirectory(Buffers)
 add_subdirectory(cudaSirecon)
 add_subdirectory(otf)
+
+# IVE-free unit test for the dvfile.h MRC reader/writer (no GPU/IVE/fixtures).
+if(BUILD_MRC)
+  add_executable(dvfile_test dvfile_test.cpp)
+  add_test(NAME dvfile_test COMMAND dvfile_test)
+endif()

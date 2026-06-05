@@ -1355,10 +1355,16 @@ void SIM_Reconstructor::loadImageData(int it, int iw) {
       for (int phase = 0; phase < m_myParams.nphases; ++phase) {
         if (m_myParams.bBgInExtHdr) {
           /* subtract the background value of each exposure stored in MRC files'
-             extended header, indexed by the section number. */
-          int extInts;
-          float extFloats[3];
-          IMRtExHdrZWT(istream_no, zsec, iw, it, &extInts, extFloats);
+             extended header, indexed by the section number. The estimated
+             background is the 3rd extended-header float (index 2). Size the
+             buffers from the header's nint/nreal so IMRtExHdrZWT can fill the
+             whole per-section record without overrunning (real DV files carry
+             ~32 floats per section). */
+          IW_MRC_HEADER extHdr;
+          IMGetHdr(istream_no, &extHdr);
+          std::vector<int> extInts(extHdr.nint > 1 ? extHdr.nint : 1);
+          std::vector<float> extFloats(extHdr.nreal > 3 ? extHdr.nreal : 3, 0.f);
+          IMRtExHdrZWT(istream_no, zsec, iw, it, extInts.data(), extFloats.data());
           m_reconData.backgroundExtra = extFloats[2];
         }
 
